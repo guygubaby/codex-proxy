@@ -84,7 +84,5 @@ and related Anthropic-compatible routes. It adds a default `anthropic-version`
 header for Anthropic message routes.
 
 For Claude Code model discovery, `/v1/models` returns Anthropic-native model
-metadata when the request includes `anthropic-version`. Upstream model IDs that
-do not start with `claude` or `anthropic` are exposed as `anthropic/<model-id>`
-so Claude Code can add them to the `/model` picker; the proxy strips that prefix
-before forwarding inference requests upstream.
+metadata with upstream model IDs when the request includes
+`anthropic-version`.

@@ -911,9 +911,6 @@ def _to_anthropic_models_response(payload: Any) -> dict[str, Any]:
             continue
 
         model_id = upstream_model_id
-        if not (model_id.startswith("claude") or model_id.startswith("anthropic")):
-            model_id = f"anthropic/{model_id}"
-
         context_window_size = _context_window_from_raw(raw_model)
         data.append(
             {
