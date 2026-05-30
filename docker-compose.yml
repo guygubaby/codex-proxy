@@ -5,13 +5,15 @@ services:
     restart: always
     environment:
       NGINX_PORT: "${NGINX_PORT:-4002}"
-      APP_PORT: "${APP_PORT:-8000}"
+      APP_HOST: app
+      APP_PORT: "8000"
+    ports:
+      - "${NGINX_PORT:-4002}:${NGINX_PORT:-4002}"
     volumes:
       - ./nginx.conf:/etc/nginx/templates/nginx.conf.template:ro
-    command: /bin/sh -c "envsubst '$$NGINX_PORT $$APP_PORT' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    command: /bin/sh -c "envsubst '$$NGINX_PORT $$APP_HOST $$APP_PORT' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
     depends_on:
       - app
-    network_mode: host
 
   app:
     build:
@@ -21,7 +23,6 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    environment:
-      APP_PORT: "${APP_PORT:-8000}"
-    command: /bin/sh -c "uvicorn main:app --host 0.0.0.0 --port $${APP_PORT:-8000}"
-    network_mode: host
+    expose:
+      - "8000"
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

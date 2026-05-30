@@ -37,7 +37,7 @@ The compose setup follows the reference project layout:
 - `app` runs `uvicorn` on `APP_PORT`, default `8000`
 - `nginx` proxies to the app with streaming buffering disabled
 - public nginx port is `NGINX_PORT`, default `4002`
-- both services use `network_mode: host`
+- services use Docker's default bridge network
 
 After deployment, use:
 
