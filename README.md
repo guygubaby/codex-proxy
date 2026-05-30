@@ -24,6 +24,11 @@ Edit `.env` and set `CODEX_PROXY_UPSTREAM_BASE_URL`.
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+Logs are written to stdout. Set `CODEX_PROXY_LOG_LEVEL=DEBUG` or
+`CODEX_PROXY_LOG_LEVEL=INFO` to adjust verbosity. Logs include request route,
+auth header source, upstream status, request ID, model transform counts, and
+truncated upstream error bodies; API keys are not logged.
+
 ## Docker Compose
 
 ```bash

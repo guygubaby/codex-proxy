@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -57,6 +58,12 @@ def _load_dotenv(path: str = ".env") -> None:
 
 
 _load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("CODEX_PROXY_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("codex_proxy")
 
 
 class Settings:
@@ -190,6 +197,81 @@ def _filter_response_headers(headers: httpx.Headers) -> dict[str, str]:
             continue
         filtered[key] = value
     return filtered
+
+
+def _truncate_log_value(value: str, limit: int = 1200) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "...<truncated>"
+
+
+def _request_auth_source(request: Request) -> str:
+    headers = {key.lower(): value for key, value in request.headers.items()}
+    if _extract_bearer(headers):
+        return "authorization"
+    if headers.get("x-api-key"):
+        return "x-api-key"
+    return "missing"
+
+
+def _log_request(request: Request, route: str, **fields: Any) -> None:
+    logger.info(
+        "request route=%s method=%s auth=%s %s",
+        route,
+        request.method,
+        _request_auth_source(request),
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+    )
+
+
+def _log_upstream_response(route: str, upstream_response: httpx.Response, elapsed_ms: int) -> None:
+    logger.info(
+        "upstream route=%s status=%s elapsed_ms=%s request_id=%s content_type=%s",
+        route,
+        upstream_response.status_code,
+        elapsed_ms,
+        upstream_response.headers.get("x-request-id", ""),
+        upstream_response.headers.get("content-type", ""),
+    )
+
+
+async def _upstream_error_response(
+    route: str,
+    upstream_response: httpx.Response,
+    elapsed_ms: int,
+) -> Response:
+    body = await upstream_response.aread()
+    logger.warning(
+        "upstream_error route=%s status=%s elapsed_ms=%s request_id=%s body=%s",
+        route,
+        upstream_response.status_code,
+        elapsed_ms,
+        upstream_response.headers.get("x-request-id", ""),
+        _truncate_log_value(body.decode("utf-8", errors="replace")),
+    )
+    await upstream_response.aclose()
+    return Response(
+        content=body,
+        status_code=upstream_response.status_code,
+        headers=_filter_response_headers(upstream_response.headers),
+        media_type=upstream_response.headers.get("content-type"),
+    )
+
+
+def _model_context_source(raw_model: Any) -> str:
+    if isinstance(raw_model, dict):
+        for key in (
+            "context_window_size",
+            "context_window",
+            "context_length",
+            "max_context_window",
+            "max_context_tokens",
+            "max_input_tokens",
+        ):
+            value = _safe_int(raw_model.get(key), 0)
+            if value > 0:
+                return key
+    return "default"
 
 
 def _anthropic_content_to_text(content: Any) -> str:
@@ -800,6 +882,7 @@ def _context_window_from_raw(raw_model: Any) -> int:
             "context_window_size",
             "context_window",
             "context_length",
+            "max_context_window",
             "max_context_tokens",
             "max_input_tokens",
         ):
@@ -886,6 +969,15 @@ async def anthropic_messages(request: Request) -> Response:
 
     model = str(payload.get("model") or "gpt-5.3-codex")
     wants_stream = bool(payload.get("stream", False))
+    _log_request(
+        request,
+        "v1/messages",
+        model=model,
+        upstream_model=_resolve_upstream_model(model),
+        stream=wants_stream,
+        messages=len(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else 0,
+        tools=len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else 0,
+    )
     upstream_payload = _anthropic_messages_to_responses_payload(payload)
     upstream_url = _build_upstream_url("v1/responses", "")
     upstream_headers = _build_upstream_headers(request, "v1/responses")
@@ -900,19 +992,17 @@ async def anthropic_messages(request: Request) -> Response:
     )
 
     try:
+        start = time.monotonic()
         upstream_response = await client.send(upstream_request, stream=True)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        _log_upstream_response("v1/messages->v1/responses", upstream_response, elapsed_ms)
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="Upstream request timed out") from exc
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
     if upstream_response.status_code >= 400:
-        return StreamingResponse(
-            upstream_response.aiter_raw(),
-            status_code=upstream_response.status_code,
-            headers=_filter_response_headers(upstream_response.headers),
-            background=BackgroundTask(upstream_response.aclose),
-        )
+        return await _upstream_error_response("v1/messages->v1/responses", upstream_response, elapsed_ms)
 
     if wants_stream:
         return StreamingResponse(
@@ -929,6 +1019,12 @@ async def anthropic_messages(request: Request) -> Response:
 @app.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(request: Request) -> dict[str, int]:
     payload = await request.json()
+    _log_request(
+        request,
+        "v1/messages/count_tokens",
+        model=payload.get("model", ""),
+        messages=len(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else 0,
+    )
     text = _anthropic_content_to_text(payload.get("system", ""))
     for message in payload.get("messages", []):
         if isinstance(message, dict):
@@ -939,24 +1035,23 @@ async def anthropic_count_tokens(request: Request) -> dict[str, int]:
 
 @app.get("/v1/models")
 async def list_models(request: Request) -> Response:
+    _log_request(request, "v1/models", mode="anthropic" if _is_anthropic_request(request) else "openai")
     upstream_url = _build_upstream_url("v1/models", request.url.query)
     upstream_headers = _build_upstream_headers(request, "v1/models")
 
     client: httpx.AsyncClient = request.app.state.http_client
     try:
+        start = time.monotonic()
         upstream_response = await client.get(upstream_url, headers=upstream_headers)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        _log_upstream_response("v1/models", upstream_response, elapsed_ms)
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="Upstream request timed out") from exc
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
     if upstream_response.status_code >= 400:
-        return Response(
-            content=upstream_response.content,
-            status_code=upstream_response.status_code,
-            headers=_filter_response_headers(upstream_response.headers),
-            media_type=upstream_response.headers.get("content-type"),
-        )
+        return await _upstream_error_response("v1/models", upstream_response, elapsed_ms)
 
     try:
         payload = upstream_response.json()
@@ -968,6 +1063,18 @@ async def list_models(request: Request) -> Response:
             media_type=upstream_response.headers.get("content-type"),
         )
 
+    raw_models = _model_list_from_payload(payload)
+    context_sources: dict[str, int] = {}
+    for raw_model in raw_models:
+        context_source = _model_context_source(raw_model)
+        context_sources[context_source] = context_sources.get(context_source, 0) + 1
+    logger.info(
+        "models_transform mode=%s count=%s context_sources=%s",
+        "anthropic" if _is_anthropic_request(request) else "openai",
+        len(raw_models),
+        context_sources,
+    )
+
     if _is_anthropic_request(request):
         return JSONResponse(_to_anthropic_models_response(payload))
 
@@ -977,14 +1084,9 @@ async def list_models(request: Request) -> Response:
 async def _proxy(request: Request, full_path: str) -> Response:
     path = _normalize_proxy_path(full_path)
     if not path:
-        return JSONResponse(
-            {
-                "ok": True,
-                "upstream": settings.upstream_base_url,
-                "routes": ["/*", "/v1/*"],
-            }
-        )
+        return JSONResponse({"ok": True})
 
+    _log_request(request, path, query=bool(request.url.query))
     upstream_url = _build_upstream_url(path, request.url.query)
     upstream_headers = _build_upstream_headers(request, path)
     body = await request.body()
@@ -998,11 +1100,17 @@ async def _proxy(request: Request, full_path: str) -> Response:
     )
 
     try:
+        start = time.monotonic()
         upstream_response = await client.send(upstream_request, stream=True)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        _log_upstream_response(path, upstream_response, elapsed_ms)
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="Upstream request timed out") from exc
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
+
+    if upstream_response.status_code >= 400:
+        return await _upstream_error_response(path, upstream_response, elapsed_ms)
 
     return StreamingResponse(
         upstream_response.aiter_raw(),
@@ -1016,7 +1124,6 @@ async def _proxy(request: Request, full_path: str) -> Response:
 async def health() -> dict[str, object]:
     return {
         "ok": True,
-        "upstream": settings.upstream_base_url,
         "has_upstream_base_url": bool(settings.upstream_base_url),
         "auth_source": "request_headers",
     }
