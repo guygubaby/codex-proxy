@@ -1,0 +1,27 @@
+services:
+  nginx:
+    image: docker.guygubaby.top/nginx:stable-alpine
+    container_name: codex-proxy-nginx
+    restart: always
+    environment:
+      NGINX_PORT: "${NGINX_PORT:-4002}"
+      APP_PORT: "${APP_PORT:-8000}"
+    volumes:
+      - ./nginx.conf:/etc/nginx/templates/nginx.conf.template:ro
+    command: /bin/sh -c "envsubst '$$NGINX_PORT $$APP_PORT' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    depends_on:
+      - app
+    network_mode: host
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: codex-proxy-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_PORT: "${APP_PORT:-8000}"
+    command: /bin/sh -c "uvicorn main:app --host 0.0.0.0 --port $${APP_PORT:-8000}"
+    network_mode: host
