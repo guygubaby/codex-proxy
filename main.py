@@ -14,6 +14,8 @@ from starlette.background import BackgroundTask
 
 DEFAULT_UPSTREAM_BASE_URL = ""
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
+DEFAULT_MODEL_CREATED_AT = "2026-01-01T00:00:00Z"
+DEFAULT_CONTEXT_WINDOW_SIZE = 200000
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -137,6 +139,16 @@ def _is_anthropic_compatible_path(path: str) -> bool:
     return normalized.startswith("v1/messages") or normalized.startswith("v1/complete")
 
 
+def _is_anthropic_request(request: Request) -> bool:
+    return "anthropic-version" in {key.lower() for key in request.headers}
+
+
+def _resolve_upstream_model(model: str) -> str:
+    if model.startswith("anthropic/"):
+        return model.split("/", 1)[1]
+    return model
+
+
 def _build_upstream_url(path: str, query: str) -> httpx.URL:
     base = settings.upstream_base_url
     if not base:
@@ -199,6 +211,10 @@ def _anthropic_content_to_text(content: Any) -> str:
         block_type = block.get("type")
         if block_type == "text":
             parts.append(str(block.get("text", "")))
+        elif block_type == "tool_use":
+            tool_name = block.get("name", "")
+            tool_input = json.dumps(block.get("input", {}), ensure_ascii=False)
+            parts.append(f"Tool use {tool_name}: {tool_input}")
         elif block_type == "tool_result":
             tool_content = block.get("content", "")
             parts.append(f"Tool result for {block.get('tool_use_id', '')}: {_anthropic_content_to_text(tool_content)}")
@@ -236,7 +252,7 @@ def _anthropic_messages_to_responses_payload(payload: dict[str, Any]) -> dict[st
         )
 
     responses_payload: dict[str, Any] = {
-        "model": payload.get("model") or "gpt-5.3-codex",
+        "model": _resolve_upstream_model(str(payload.get("model") or "gpt-5.3-codex")),
         "input": input_items,
         "stream": True,
     }
@@ -334,13 +350,198 @@ def _extract_response_text(data: dict[str, Any]) -> str:
     return ""
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return default
+    return default
+
+
+def _anthropic_usage_from_response_usage(usage: Any) -> dict[str, int]:
+    if not isinstance(usage, dict):
+        usage = {}
+
+    total_input_tokens = _safe_int(usage.get("input_tokens", usage.get("prompt_tokens", 0)))
+    output_tokens = _safe_int(usage.get("output_tokens", usage.get("completion_tokens", 0)))
+    input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    cached_tokens = _safe_int(input_details.get("cached_tokens", 0)) if isinstance(input_details, dict) else 0
+
+    return {
+        "input_tokens": max(total_input_tokens - cached_tokens, 0),
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+def _extract_response_usage(data: dict[str, Any]) -> dict[str, int]:
+    response = data.get("response")
+    if isinstance(response, dict):
+        return _anthropic_usage_from_response_usage(response.get("usage", {}))
+    return _anthropic_usage_from_response_usage(data.get("usage", {}))
+
+
+def _extract_tool_call_from_item(item: Any) -> dict[str, str] | None:
+    if not isinstance(item, dict):
+        return None
+
+    item_type = item.get("type")
+    if item_type not in {"function_call", "tool_call"}:
+        return None
+
+    name = item.get("name") or item.get("function", {}).get("name")
+    if not name:
+        return None
+
+    arguments = item.get("arguments")
+    if arguments is None:
+        arguments = item.get("function", {}).get("arguments", "")
+    if isinstance(arguments, dict):
+        arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    else:
+        arguments = str(arguments or "")
+
+    return {
+        "item_id": str(item.get("id") or item.get("call_id") or name),
+        "tool_use_id": str(item.get("call_id") or item.get("id") or f"toolu_{int(time.time() * 1000)}"),
+        "name": str(name),
+        "arguments": arguments,
+    }
+
+
+def _extract_completed_tool_calls(data: dict[str, Any]) -> list[dict[str, str]]:
+    response = data.get("response")
+    if not isinstance(response, dict):
+        return []
+
+    output = response.get("output", [])
+    if not isinstance(output, list):
+        return []
+
+    tool_calls: list[dict[str, str]] = []
+    for item in output:
+        tool_call = _extract_tool_call_from_item(item)
+        if tool_call:
+            tool_calls.append(tool_call)
+    return tool_calls
+
+
 async def _anthropic_stream_from_responses(
     upstream_response: httpx.Response,
     model: str,
 ) -> AsyncIterator[bytes]:
     message_id = f"msg_{int(time.time() * 1000)}"
     output_text = ""
-    content_started = False
+    text_index: int | None = None
+    next_content_index = 0
+    tool_blocks: dict[str, dict[str, Any]] = {}
+    tool_used = False
+    final_usage = _anthropic_usage_from_response_usage({})
+
+    async def emit_text_delta(text_delta: str) -> AsyncIterator[bytes]:
+        nonlocal output_text, text_index, next_content_index
+
+        if not text_delta:
+            return
+
+        if text_index is None:
+            text_index = next_content_index
+            next_content_index += 1
+            yield _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": text_index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+
+        output_text += text_delta
+        yield _sse_event(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": text_index,
+                "delta": {"type": "text_delta", "text": text_delta},
+            },
+        )
+
+    async def start_tool_block(tool_call: dict[str, str]) -> AsyncIterator[bytes]:
+        nonlocal next_content_index, tool_used
+
+        item_id = tool_call["item_id"]
+        if item_id not in tool_blocks:
+            tool_blocks[item_id] = {
+                "index": next_content_index,
+                "tool_use_id": tool_call["tool_use_id"],
+                "name": tool_call["name"],
+                "arguments": "",
+                "started": False,
+                "stopped": False,
+            }
+            next_content_index += 1
+
+        block = tool_blocks[item_id]
+        if not block["started"]:
+            block["started"] = True
+            tool_used = True
+            yield _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block["index"],
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": block["tool_use_id"],
+                        "name": block["name"],
+                        "input": {},
+                    },
+                },
+            )
+
+    async def emit_tool_arguments(tool_call: dict[str, str], arguments_delta: str) -> AsyncIterator[bytes]:
+        item_id = tool_call["item_id"]
+        async for chunk in start_tool_block(tool_call):
+            yield chunk
+
+        if not arguments_delta:
+            return
+
+        block = tool_blocks[item_id]
+        block["arguments"] += arguments_delta
+        yield _sse_event(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": block["index"],
+                "delta": {"type": "input_json_delta", "partial_json": arguments_delta},
+            },
+        )
+
+    async def stop_tool_block(tool_call: dict[str, str]) -> AsyncIterator[bytes]:
+        item_id = tool_call["item_id"]
+        async for chunk in start_tool_block(tool_call):
+            yield chunk
+
+        block = tool_blocks[item_id]
+        if not block["arguments"] and tool_call.get("arguments"):
+            async for chunk in emit_tool_arguments(tool_call, tool_call["arguments"]):
+                yield chunk
+
+        if not block["stopped"]:
+            block["stopped"] = True
+            yield _sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block["index"]},
+            )
 
     yield _sse_event(
         "message_start",
@@ -354,99 +555,148 @@ async def _anthropic_stream_from_responses(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": final_usage,
             },
         },
     )
 
-    async for event, raw_data in _iter_sse_events(upstream_response):
-        if raw_data == "[DONE]":
-            continue
-
-        try:
-            data = json.loads(raw_data)
-        except json.JSONDecodeError:
-            continue
-
-        event_type = data.get("type") or event
-        if event_type == "response.output_text.delta":
-            text_delta = _extract_response_text(data)
-            if not text_delta:
+    try:
+        async for event, raw_data in _iter_sse_events(upstream_response):
+            if raw_data == "[DONE]":
                 continue
 
-            if not content_started:
-                content_started = True
+            try:
+                data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+
+            event_type = data.get("type") or event
+            if event_type == "response.output_text.delta":
+                async for chunk in emit_text_delta(_extract_response_text(data)):
+                    yield chunk
+
+            elif event_type == "response.output_text.done":
+                done_text = _extract_response_text(data)
+                if done_text and done_text.startswith(output_text):
+                    async for chunk in emit_text_delta(done_text[len(output_text) :]):
+                        yield chunk
+                elif done_text and not output_text:
+                    async for chunk in emit_text_delta(done_text):
+                        yield chunk
+
+            elif event_type == "response.output_item.added":
+                tool_call = _extract_tool_call_from_item(data.get("item"))
+                if tool_call:
+                    async for chunk in start_tool_block(tool_call):
+                        yield chunk
+
+            elif event_type == "response.function_call_arguments.delta":
+                item_id = str(data.get("item_id") or data.get("output_item_id") or data.get("call_id") or "")
+                tool_call = tool_blocks.get(item_id)
+                if tool_call:
+                    normalized_tool_call = {
+                        "item_id": item_id,
+                        "tool_use_id": str(tool_call["tool_use_id"]),
+                        "name": str(tool_call["name"]),
+                        "arguments": "",
+                    }
+                    async for chunk in emit_tool_arguments(normalized_tool_call, str(data.get("delta", ""))):
+                        yield chunk
+
+            elif event_type == "response.function_call_arguments.done":
+                item_id = str(data.get("item_id") or data.get("output_item_id") or data.get("call_id") or "")
+                block = tool_blocks.get(item_id)
+                if block:
+                    tool_call = {
+                        "item_id": item_id,
+                        "tool_use_id": str(block["tool_use_id"]),
+                        "name": str(block["name"]),
+                        "arguments": str(data.get("arguments", "")),
+                    }
+                    async for chunk in stop_tool_block(tool_call):
+                        yield chunk
+
+            elif event_type == "response.output_item.done":
+                tool_call = _extract_tool_call_from_item(data.get("item"))
+                if tool_call:
+                    async for chunk in stop_tool_block(tool_call):
+                        yield chunk
+
+            elif event_type == "response.completed":
+                completed_text = _extract_response_text(data)
+                if completed_text and completed_text.startswith(output_text):
+                    async for chunk in emit_text_delta(completed_text[len(output_text) :]):
+                        yield chunk
+                elif completed_text and not output_text:
+                    async for chunk in emit_text_delta(completed_text):
+                        yield chunk
+
+                for tool_call in _extract_completed_tool_calls(data):
+                    async for chunk in stop_tool_block(tool_call):
+                        yield chunk
+
+                final_usage = _extract_response_usage(data)
+
+            elif event_type in {"response.failed", "response.incomplete", "error"}:
+                error = data.get("error", data)
+                message = error.get("message", "Upstream response failed") if isinstance(error, dict) else str(error)
                 yield _sse_event(
-                    "content_block_start",
+                    "error",
                     {
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "text", "text": ""},
+                        "type": "error",
+                        "error": {"type": "api_error", "message": message},
                     },
                 )
+                return
 
-            output_text += text_delta
+        if text_index is not None:
+            yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": text_index})
+
+        for block in list(tool_blocks.values()):
+            if not block["stopped"]:
+                block["stopped"] = True
+                yield _sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block["index"]},
+                )
+
+        if text_index is None and not tool_used:
             yield _sse_event(
-                "content_block_delta",
+                "content_block_start",
                 {
-                    "type": "content_block_delta",
+                    "type": "content_block_start",
                     "index": 0,
-                    "delta": {"type": "text_delta", "text": text_delta},
+                    "content_block": {"type": "text", "text": ""},
                 },
             )
+            yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
 
-        elif event_type == "response.completed":
-            if not content_started and output_text:
-                content_started = True
-                yield _sse_event(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-                yield _sse_event(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": output_text},
-                    },
-                )
-
-            response = data.get("response", {})
-            usage = response.get("usage", {}) if isinstance(response, dict) else {}
-            if content_started:
-                yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
-            yield _sse_event(
-                "message_delta",
-                {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                    "usage": {
-                        "output_tokens": usage.get("output_tokens", 0),
-                    },
-                },
-            )
-
-    if not content_started:
         yield _sse_event(
-            "content_block_start",
+            "message_delta",
             {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "tool_use" if tool_used else "end_turn",
+                    "stop_sequence": None,
+                },
+                "usage": final_usage,
             },
         )
-        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
-
-    yield _sse_event("message_stop", {"type": "message_stop"})
+        yield _sse_event("message_stop", {"type": "message_stop"})
+    except httpx.HTTPError as exc:
+        yield _sse_event(
+            "error",
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": f"Upstream stream failed: {exc}"},
+            },
+        )
 
 
 async def _anthropic_message_from_responses(upstream_response: httpx.Response, model: str) -> Response:
     output_text = ""
-    usage: dict[str, Any] = {}
+    usage = _anthropic_usage_from_response_usage({})
+    tool_calls: list[dict[str, str]] = []
 
     async for event, raw_data in _iter_sse_events(upstream_response):
         if raw_data == "[DONE]":
@@ -459,10 +709,47 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
         event_type = data.get("type") or event
         if event_type == "response.output_text.delta":
             output_text += _extract_response_text(data)
+        elif event_type == "response.output_text.done":
+            done_text = _extract_response_text(data)
+            if done_text and done_text.startswith(output_text):
+                output_text += done_text[len(output_text) :]
+            elif done_text and not output_text:
+                output_text = done_text
+        elif event_type == "response.output_item.done":
+            tool_call = _extract_tool_call_from_item(data.get("item"))
+            if tool_call:
+                tool_calls.append(tool_call)
         elif event_type == "response.completed":
-            response = data.get("response", {})
-            if isinstance(response, dict):
-                usage = response.get("usage", {}) or usage
+            completed_text = _extract_response_text(data)
+            if completed_text and completed_text.startswith(output_text):
+                output_text += completed_text[len(output_text) :]
+            elif completed_text and not output_text:
+                output_text = completed_text
+            usage = _extract_response_usage(data)
+            tool_calls.extend(_extract_completed_tool_calls(data))
+
+    content: list[dict[str, Any]] = []
+    if output_text:
+        content.append({"type": "text", "text": output_text})
+
+    seen_tool_ids: set[str] = set()
+    for tool_call in tool_calls:
+        tool_use_id = tool_call["tool_use_id"]
+        if tool_use_id in seen_tool_ids:
+            continue
+        seen_tool_ids.add(tool_use_id)
+        try:
+            tool_input = json.loads(tool_call.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            tool_input = {"arguments": tool_call.get("arguments", "")}
+        content.append(
+            {
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": tool_call["name"],
+                "input": tool_input,
+            }
+        )
 
     return JSONResponse(
         {
@@ -470,15 +757,125 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
             "type": "message",
             "role": "assistant",
             "model": model,
-            "content": [{"type": "text", "text": output_text}],
-            "stop_reason": "end_turn",
+            "content": content or [{"type": "text", "text": ""}],
+            "stop_reason": "tool_use" if tool_calls else "end_turn",
             "stop_sequence": None,
-            "usage": {
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-            },
+            "usage": usage,
         }
     )
+
+
+def _model_id_from_raw(raw_model: Any) -> str:
+    if isinstance(raw_model, str):
+        return raw_model
+    if not isinstance(raw_model, dict):
+        return ""
+    return str(raw_model.get("id") or raw_model.get("slug") or raw_model.get("name") or "")
+
+
+def _display_name_from_raw(raw_model: Any, model_id: str) -> str:
+    if isinstance(raw_model, dict):
+        value = raw_model.get("display_name") or raw_model.get("name") or raw_model.get("id") or raw_model.get("slug")
+        if value:
+            return str(value)
+    return model_id
+
+
+def _created_at_from_raw(raw_model: Any) -> str:
+    if isinstance(raw_model, dict):
+        created_at = raw_model.get("created_at")
+        if isinstance(created_at, str) and created_at:
+            return created_at
+
+        created = raw_model.get("created")
+        if isinstance(created, (int, float)):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created))
+
+    return DEFAULT_MODEL_CREATED_AT
+
+
+def _context_window_from_raw(raw_model: Any) -> int:
+    if isinstance(raw_model, dict):
+        for key in (
+            "context_window_size",
+            "context_window",
+            "context_length",
+            "max_context_tokens",
+            "max_input_tokens",
+        ):
+            value = _safe_int(raw_model.get(key), 0)
+            if value > 0:
+                return value
+    return DEFAULT_CONTEXT_WINDOW_SIZE
+
+
+def _model_list_from_payload(payload: Any) -> list[Any]:
+    if isinstance(payload, dict):
+        if isinstance(payload.get("data"), list):
+            return payload["data"]
+        if isinstance(payload.get("models"), list):
+            return payload["models"]
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _to_anthropic_models_response(payload: Any) -> dict[str, Any]:
+    data: list[dict[str, Any]] = []
+    for raw_model in _model_list_from_payload(payload):
+        upstream_model_id = _model_id_from_raw(raw_model)
+        if not upstream_model_id:
+            continue
+
+        model_id = upstream_model_id
+        if not (model_id.startswith("claude") or model_id.startswith("anthropic")):
+            model_id = f"anthropic/{model_id}"
+
+        context_window_size = _context_window_from_raw(raw_model)
+        data.append(
+            {
+                "type": "model",
+                "id": model_id,
+                "display_name": _display_name_from_raw(raw_model, upstream_model_id),
+                "created_at": _created_at_from_raw(raw_model),
+                "max_input_tokens": context_window_size,
+                "context_window_size": context_window_size,
+            }
+        )
+
+    return {
+        "data": data,
+        "has_more": False,
+        "first_id": data[0]["id"] if data else None,
+        "last_id": data[-1]["id"] if data else None,
+    }
+
+
+def _to_openai_models_response(payload: Any) -> dict[str, Any]:
+    data: list[dict[str, Any]] = []
+    for raw_model in _model_list_from_payload(payload):
+        model_id = _model_id_from_raw(raw_model)
+        if not model_id:
+            continue
+
+        created_at = _created_at_from_raw(raw_model)
+        created = int(time.time())
+        try:
+            created = int(time.mktime(time.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")))
+        except ValueError:
+            pass
+
+        data.append(
+            {
+                "id": model_id,
+                "object": "model",
+                "created": created,
+                "owned_by": "upstream",
+                "display_name": _display_name_from_raw(raw_model, model_id),
+            }
+        )
+
+    return {"object": "list", "data": data}
 
 
 @app.post("/v1/messages")
@@ -538,6 +935,43 @@ async def anthropic_count_tokens(request: Request) -> dict[str, int]:
             text += "\n" + _anthropic_content_to_text(message.get("content", ""))
 
     return {"input_tokens": max(1, len(text) // 4)}
+
+
+@app.get("/v1/models")
+async def list_models(request: Request) -> Response:
+    upstream_url = _build_upstream_url("v1/models", request.url.query)
+    upstream_headers = _build_upstream_headers(request, "v1/models")
+
+    client: httpx.AsyncClient = request.app.state.http_client
+    try:
+        upstream_response = await client.get(upstream_url, headers=upstream_headers)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="Upstream request timed out") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
+
+    if upstream_response.status_code >= 400:
+        return Response(
+            content=upstream_response.content,
+            status_code=upstream_response.status_code,
+            headers=_filter_response_headers(upstream_response.headers),
+            media_type=upstream_response.headers.get("content-type"),
+        )
+
+    try:
+        payload = upstream_response.json()
+    except json.JSONDecodeError:
+        return Response(
+            content=upstream_response.content,
+            status_code=upstream_response.status_code,
+            headers=_filter_response_headers(upstream_response.headers),
+            media_type=upstream_response.headers.get("content-type"),
+        )
+
+    if _is_anthropic_request(request):
+        return JSONResponse(_to_anthropic_models_response(payload))
+
+    return JSONResponse(_to_openai_models_response(payload))
 
 
 async def _proxy(request: Request, full_path: str) -> Response:
