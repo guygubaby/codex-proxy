@@ -4,9 +4,8 @@ Python 3 proxy for OpenAI-compatible clients, OpenAI Codex CLI style `/v1/*`
 routes, and Claude Code / Anthropic-compatible `/v1/messages*` routes.
 
 The proxy forwards requests to the upstream configured by
-`CODEX_PROXY_UPSTREAM_BASE_URL`. Local client authentication is disabled by
-default, so tools can point at this proxy without sending the upstream key. The
-proxy injects the upstream key from `CODEX_PROXY_UPSTREAM_API_KEY`.
+`CODEX_PROXY_UPSTREAM_BASE_URL`. API keys are read from each incoming request,
+then forwarded upstream as `Authorization: Bearer ...` and `x-api-key`.
 
 ## Setup
 
@@ -17,8 +16,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and set `CODEX_PROXY_UPSTREAM_BASE_URL` and
-`CODEX_PROXY_UPSTREAM_API_KEY`.
+Edit `.env` and set `CODEX_PROXY_UPSTREAM_BASE_URL`.
 
 ## Run
 
@@ -30,7 +28,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ```bash
 cp .env.example .env
-# edit .env and set CODEX_PROXY_UPSTREAM_API_KEY
+# edit .env and set CODEX_PROXY_UPSTREAM_BASE_URL
 docker compose up -d --build
 ```
 
@@ -54,7 +52,7 @@ Use this proxy as the OpenAI base URL:
 
 ```bash
 export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
-export OPENAI_API_KEY=anything
+export OPENAI_API_KEY=your-upstream-api-key
 ```
 
 The proxy forwards paths such as:
@@ -72,32 +70,9 @@ Use this proxy as the Anthropic base URL:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
-export ANTHROPIC_AUTH_TOKEN=anything
-export ANTHROPIC_API_KEY=anything
+export ANTHROPIC_AUTH_TOKEN=your-upstream-api-key
 ```
 
 The proxy forwards `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`,
-and related Anthropic-compatible routes. It sends both `Authorization` and
-`x-api-key` upstream, plus a default `anthropic-version` header for Anthropic
-message routes.
-
-## Optional Local Auth
-
-To require callers to authenticate to the proxy itself:
-
-```bash
-CODEX_PROXY_LOCAL_API_KEY=local-proxy-token
-CODEX_PROXY_ALLOW_UNAUTHENTICATED=false
-```
-
-Clients may then send either:
-
-```text
-Authorization: Bearer local-proxy-token
-```
-
-or:
-
-```text
-x-api-key: local-proxy-token
-```
+and related Anthropic-compatible routes. It adds a default `anthropic-version`
+header for Anthropic message routes.

@@ -63,16 +63,7 @@ class Settings:
             "CODEX_PROXY_UPSTREAM_BASE_URL",
             DEFAULT_UPSTREAM_BASE_URL,
         ).rstrip("/")
-        self.upstream_api_key = os.getenv("CODEX_PROXY_UPSTREAM_API_KEY", "")
-        self.local_api_key = os.getenv("CODEX_PROXY_LOCAL_API_KEY", "")
-        self.allow_unauthenticated = _env_bool(
-            "CODEX_PROXY_ALLOW_UNAUTHENTICATED",
-            default=not bool(self.local_api_key),
-        )
-        self.anthropic_version = os.getenv(
-            "CODEX_PROXY_ANTHROPIC_VERSION",
-            DEFAULT_ANTHROPIC_VERSION,
-        )
+        self.anthropic_version = DEFAULT_ANTHROPIC_VERSION
         self.connect_timeout = _env_float("CODEX_PROXY_CONNECT_TIMEOUT", 30.0)
         self.write_timeout = _env_float("CODEX_PROXY_WRITE_TIMEOUT", 60.0)
         self.pool_timeout = _env_float("CODEX_PROXY_POOL_TIMEOUT", 30.0)
@@ -132,15 +123,9 @@ def _extract_bearer(headers: dict[str, str]) -> str:
     return ""
 
 
-def _authenticate_client(request: Request) -> None:
-    if settings.allow_unauthenticated:
-        return
-
+def _extract_request_api_key(request: Request) -> str:
     headers = {key.lower(): value for key, value in request.headers.items()}
-    presented_key = _extract_bearer(headers) or headers.get("x-api-key", "")
-
-    if not settings.local_api_key or presented_key != settings.local_api_key:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    return _extract_bearer(headers) or headers.get("x-api-key", "")
 
 
 def _normalize_proxy_path(full_path: str) -> str:
@@ -174,9 +159,10 @@ def _build_upstream_headers(request: Request, path: str) -> dict[str, str]:
             continue
         headers[key] = value
 
-    if settings.upstream_api_key:
-        headers["authorization"] = f"Bearer {settings.upstream_api_key}"
-        headers["x-api-key"] = settings.upstream_api_key
+    request_api_key = _extract_request_api_key(request)
+    if request_api_key:
+        headers["authorization"] = f"Bearer {request_api_key}"
+        headers["x-api-key"] = request_api_key
 
     if _is_anthropic_compatible_path(path):
         headers.setdefault("anthropic-version", settings.anthropic_version)
@@ -497,8 +483,6 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request) -> Response:
-    _authenticate_client(request)
-
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
@@ -557,8 +541,6 @@ async def anthropic_count_tokens(request: Request) -> dict[str, int]:
 
 
 async def _proxy(request: Request, full_path: str) -> Response:
-    _authenticate_client(request)
-
     path = _normalize_proxy_path(full_path)
     if not path:
         return JSONResponse(
@@ -602,8 +584,7 @@ async def health() -> dict[str, object]:
         "ok": True,
         "upstream": settings.upstream_base_url,
         "has_upstream_base_url": bool(settings.upstream_base_url),
-        "has_upstream_api_key": bool(settings.upstream_api_key),
-        "allow_unauthenticated": settings.allow_unauthenticated,
+        "auth_source": "request_headers",
     }
 
 
