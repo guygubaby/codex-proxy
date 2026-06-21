@@ -1,54 +1,56 @@
 # Codex API Proxy
 
-Python 3 proxy for OpenAI-compatible clients, OpenAI Codex CLI style `/v1/*`
-routes, and Claude Code / Anthropic-compatible `/v1/messages*` routes.
+Cloudflare Worker proxy for OpenAI-compatible clients, OpenAI Codex CLI style
+`/v1/*` routes, and Claude Code / Anthropic-compatible `/v1/messages*` routes.
 
 The proxy forwards requests to the upstream configured by
 `CODEX_PROXY_UPSTREAM_BASE_URL`. API keys are read from each incoming request,
 then forwarded upstream as `Authorization: Bearer ...` and `x-api-key`.
 
+This project now targets Cloudflare Workers only. Docker, nginx, and Python
+runtime deployment paths have been removed.
+
 ## Setup
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+pnpm install
 ```
 
-Edit `.env` and set `CODEX_PROXY_UPSTREAM_BASE_URL`.
-
-## Run
+Configure the upstream base URL for the Worker:
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+pnpm exec wrangler secret put CODEX_PROXY_UPSTREAM_BASE_URL
 ```
 
-Logs are written to stdout. Set `CODEX_PROXY_LOG_LEVEL=DEBUG` or
-`CODEX_PROXY_LOG_LEVEL=INFO` to adjust verbosity. Logs include request route,
-auth header source, upstream status, request ID, model transform counts, and
-truncated upstream error bodies; API keys are not logged.
+Set the secret value to the upstream API base URL, for example
+`https://api.example.com`.
 
-## Docker Compose
+## Deploy
 
 ```bash
-cp .env.example .env
-# edit .env and set CODEX_PROXY_UPSTREAM_BASE_URL
-docker compose up -d --build
+pnpm run deploy
 ```
 
-The compose setup follows the reference project layout:
-
-- `app` runs `uvicorn` on `APP_PORT`, default `8000`
-- `nginx` proxies to the app with streaming buffering disabled
-- public nginx port is `NGINX_PORT`, default `4002`
-- services use Docker's default bridge network
-
-After deployment, use:
+To validate the Worker bundle without deploying:
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:4002/v1
-export ANTHROPIC_BASE_URL=http://127.0.0.1:4002
+pnpm run deploy:dry-run
+```
+
+## Local Dev
+
+Copy the example local vars file and fill in the upstream URL:
+
+```bash
+cp .dev.vars.example .dev.vars
+pnpm dev
+```
+
+After deployment, use your Worker URL:
+
+```bash
+export OPENAI_BASE_URL=https://codex-proxy.<account>.workers.dev/v1
+export ANTHROPIC_BASE_URL=https://codex-proxy.<account>.workers.dev
 ```
 
 ## OpenAI / Codex CLI
@@ -56,7 +58,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:4002
 Use this proxy as the OpenAI base URL:
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+export OPENAI_BASE_URL=https://codex-proxy.<account>.workers.dev/v1
 export OPENAI_API_KEY=your-upstream-api-key
 ```
 
@@ -74,7 +76,7 @@ The proxy forwards paths such as:
 Use this proxy as the Anthropic base URL:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_BASE_URL=https://codex-proxy.<account>.workers.dev
 export ANTHROPIC_AUTH_TOKEN=your-upstream-api-key
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
@@ -86,3 +88,10 @@ header for Anthropic message routes.
 For Claude Code model discovery, `/v1/models` returns Anthropic-native model
 metadata with upstream model IDs when the request includes
 `anthropic-version`.
+
+## Health Checks
+
+```bash
+curl https://codex-proxy.<account>.workers.dev/health
+curl https://codex-proxy.<account>.workers.dev/healthz
+```
