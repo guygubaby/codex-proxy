@@ -2,6 +2,14 @@ const DEFAULT_UPSTREAM_BASE_URL = "";
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 const DEFAULT_MODEL_CREATED_AT = "2026-01-01T00:00:00Z";
 const DEFAULT_CONTEXT_WINDOW_SIZE = 200000;
+const NGINX_404_HTML = `<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>
+`;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -194,7 +202,7 @@ async function listModels(request, env) {
 
 async function proxyRequest(request, env, path) {
   if (!path) {
-    return jsonResponse({ ok: true });
+    return nginx404Response(request.method);
   }
 
   const requestUrl = new URL(request.url);
@@ -1112,6 +1120,15 @@ function jsonResponse(payload, status = 200) {
 
 function errorJson(status, detail) {
   return jsonResponse({ detail }, status);
+}
+
+function nginx404Response(method) {
+  return new Response(method === "HEAD" ? null : NGINX_404_HTML, {
+    status: 404,
+    headers: {
+      "content-type": "text/html",
+    },
+  });
 }
 
 function truncateLogValue(value, limit = 1200) {
