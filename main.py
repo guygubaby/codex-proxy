@@ -445,6 +445,81 @@ def _anthropic_messages_to_responses_payload(
     return responses_payload
 
 
+def _anthropic_messages_to_legacy_text_responses_payload(
+    payload: dict[str, Any],
+    *,
+    stream: bool,
+    codex_compat: bool,
+) -> dict[str, Any]:
+    input_items: list[dict[str, str]] = []
+
+    system = payload.get("system")
+    if system:
+        input_items.append(
+            {
+                "role": "system",
+                "content": _anthropic_content_to_text(system),
+            }
+        )
+
+    for message in payload.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+
+        role = message.get("role", "user")
+        if role not in {"user", "assistant", "system", "developer"}:
+            role = "user"
+
+        input_items.append(
+            {
+                "role": role,
+                "content": _anthropic_content_to_text(message.get("content", "")),
+            }
+        )
+
+    responses_payload: dict[str, Any] = {
+        "model": _resolve_upstream_model(str(payload.get("model") or "gpt-5.3-codex")),
+        "input": input_items,
+        "stream": stream,
+    }
+
+    max_tokens = payload.get("max_tokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        responses_payload["max_output_tokens"] = max_tokens
+
+    temperature = payload.get("temperature")
+    if isinstance(temperature, (int, float)):
+        responses_payload["temperature"] = temperature
+
+    top_p = payload.get("top_p")
+    if isinstance(top_p, (int, float)):
+        responses_payload["top_p"] = top_p
+
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools:
+        responses_payload["tools"] = [
+            {
+                "type": "function",
+                "name": tool.get("name"),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+            }
+            for tool in tools
+            if isinstance(tool, dict) and tool.get("name")
+        ]
+
+    tool_choice = _responses_tool_choice(payload.get("tool_choice"))
+    if tool_choice:
+        responses_payload["tool_choice"] = tool_choice
+
+    if codex_compat:
+        responses_payload["store"] = False
+        responses_payload.pop("max_output_tokens", None)
+        responses_payload.pop("temperature", None)
+
+    return responses_payload
+
+
 def _append_responses_user_input(input_items: list[dict[str, Any]], content: Any) -> None:
     if not isinstance(content, list):
         text = _anthropic_content_to_text(content)
@@ -785,10 +860,8 @@ def _extract_response_failure(data: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _should_retry_without_tools(response: Response, payload: dict[str, Any]) -> bool:
+def _is_retryable_codex_failure(response: Response) -> bool:
     if not _is_codex_upstream():
-        return False
-    if not isinstance(payload.get("tools"), list) or not payload["tools"]:
         return False
     if getattr(response, "status_code", 200) < 500:
         return False
@@ -800,6 +873,10 @@ def _should_retry_without_tools(response: Response, payload: dict[str, Any]) -> 
         body_text = str(body)
 
     return "stream_incomplete" in body_text or "websocket closed" in body_text or "Upstream response failed" in body_text
+
+
+def _has_tools(payload: dict[str, Any]) -> bool:
+    return isinstance(payload.get("tools"), list) and bool(payload["tools"])
 
 
 def _without_tools_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1637,14 +1714,15 @@ async def anthropic_messages(request: Request) -> Response:
 
     response = await _anthropic_message_from_responses(upstream_response, model)
     await upstream_response.aclose()
-    if _should_retry_without_tools(response, payload):
+
+    async def retry_with_legacy_text(retry_source_payload: dict[str, Any], label: str) -> Response:
         logger.warning(
-            "retry_without_tools model=%s tools=%s reason=upstream_response_failed",
+            "%s model=%s tools=%s reason=upstream_response_failed",
+            label,
             model,
-            len(payload.get("tools", [])),
+            len(retry_source_payload.get("tools", [])) if isinstance(retry_source_payload.get("tools"), list) else 0,
         )
-        retry_source_payload = _without_tools_payload(payload)
-        retry_upstream_payload = _anthropic_messages_to_responses_payload(
+        retry_upstream_payload = _anthropic_messages_to_legacy_text_responses_payload(
             retry_source_payload,
             stream=False,
             codex_compat=_is_codex_upstream(),
@@ -1663,7 +1741,7 @@ async def anthropic_messages(request: Request) -> Response:
             start = time.monotonic()
             retry_upstream_response = await client.send(retry_upstream_request, stream=True)
             retry_elapsed_ms = int((time.monotonic() - start) * 1000)
-            retry_route = f"{route}:retry_without_tools"
+            retry_route = f"{route}:{label}"
             _log_upstream_response(retry_route, retry_upstream_response, retry_elapsed_ms)
         except httpx.TimeoutException as exc:
             raise HTTPException(status_code=504, detail="Upstream retry timed out") from exc
@@ -1675,6 +1753,12 @@ async def anthropic_messages(request: Request) -> Response:
 
         retry_response = await _anthropic_message_from_responses(retry_upstream_response, model)
         await retry_upstream_response.aclose()
+        return retry_response
+
+    if _is_retryable_codex_failure(response):
+        retry_response = await retry_with_legacy_text(payload, "retry_legacy_text")
+        if _is_retryable_codex_failure(retry_response) and _has_tools(payload):
+            retry_response = await retry_with_legacy_text(_without_tools_payload(payload), "retry_legacy_text_without_tools")
         return retry_response
 
     return response
