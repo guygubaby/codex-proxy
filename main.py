@@ -590,28 +590,122 @@ async def _iter_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str 
         yield event, "\n".join(data_lines)
 
 
+def _text_from_string_fields(data: Any, keys: tuple[str, ...]) -> str:
+    if not isinstance(data, dict):
+        return ""
+
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str):
+            return value
+
+    return ""
+
+
+def _extract_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, dict):
+        text = _text_from_string_fields(content, ("text", "output_text", "content"))
+        if text:
+            return text
+        return _extract_content_text(content.get("content"))
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            text = _extract_content_text(block)
+            if text:
+                parts.append(text)
+        return "".join(parts)
+
+    return ""
+
+
+def _extract_choice_text(data: dict[str, Any]) -> str:
+    choices = data.get("choices")
+    if not isinstance(choices, list):
+        return ""
+
+    parts: list[str] = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+
+        delta_text = _extract_content_text(choice.get("delta"))
+        if delta_text:
+            parts.append(delta_text)
+            continue
+
+        text = _text_from_string_fields(choice, ("text", "content"))
+        if text:
+            parts.append(text)
+            continue
+
+        message_text = _extract_content_text(choice.get("message"))
+        if message_text:
+            parts.append(message_text)
+
+    return "".join(parts)
+
+
+def _is_openai_choice_delta(data: dict[str, Any]) -> bool:
+    choices = data.get("choices")
+    if not isinstance(choices, list):
+        return False
+    return any(isinstance(choice, dict) and isinstance(choice.get("delta"), dict) for choice in choices)
+
+
+def _extract_response_item_text(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+
+    text = _text_from_string_fields(item, ("text", "output_text"))
+    if text:
+        return text
+
+    return _extract_content_text(item.get("content"))
+
+
 def _extract_response_text(data: dict[str, Any]) -> str:
     delta = data.get("delta")
     if isinstance(delta, str):
         return delta
+    if isinstance(delta, dict):
+        text = _extract_content_text(delta)
+        if text:
+            return text
 
-    text = data.get("text")
-    if isinstance(text, str):
+    choice_text = _extract_choice_text(data)
+    if choice_text:
+        return choice_text
+
+    text = _text_from_string_fields(data, ("text", "output_text", "content"))
+    if text:
         return text
+
+    part_text = _extract_content_text(data.get("part"))
+    if part_text:
+        return part_text
+
+    item_text = _extract_response_item_text(data.get("item"))
+    if item_text:
+        return item_text
 
     response = data.get("response")
     if isinstance(response, dict):
+        output_text = response.get("output_text")
+        if isinstance(output_text, str):
+            return output_text
+
         output = response.get("output")
         if isinstance(output, list):
             parts: list[str] = []
             for item in output:
-                if not isinstance(item, dict):
-                    continue
-                for content in item.get("content", []):
-                    if isinstance(content, dict):
-                        value = content.get("text")
-                        if isinstance(value, str):
-                            parts.append(value)
+                text = _extract_response_item_text(item)
+                if text:
+                    parts.append(text)
             return "".join(parts)
 
     return ""
@@ -752,6 +846,19 @@ async def _anthropic_stream_from_responses(
             },
         )
 
+    async def emit_text_snapshot(text_snapshot: str, *, allow_disjoint: bool = False) -> AsyncIterator[bytes]:
+        if not text_snapshot:
+            return
+
+        if text_snapshot.startswith(output_text):
+            async for chunk in emit_text_delta(text_snapshot[len(output_text) :]):
+                yield chunk
+            return
+
+        if not output_text or (allow_disjoint and text_snapshot not in output_text):
+            async for chunk in emit_text_delta(text_snapshot):
+                yield chunk
+
     async def start_tool_block(tool_call: dict[str, str]) -> AsyncIterator[bytes]:
         nonlocal next_content_index, tool_used
 
@@ -838,6 +945,8 @@ async def _anthropic_stream_from_responses(
         },
     )
 
+    seen_event_types: set[str] = set()
+
     try:
         async for event, raw_data in _iter_sse_events(upstream_response):
             if raw_data == "[DONE]":
@@ -848,19 +957,23 @@ async def _anthropic_stream_from_responses(
             except json.JSONDecodeError:
                 continue
 
-            event_type = data.get("type") or event
-            if event_type == "response.output_text.delta":
+            event_type = data.get("type") or data.get("object") or event
+            seen_event_types.add(str(event_type or "(none)"))
+            if event_type in {"response.output_text.delta", "response.text.delta", "response.content_part.delta"}:
                 async for chunk in emit_text_delta(_extract_response_text(data)):
                     yield chunk
 
-            elif event_type == "response.output_text.done":
-                done_text = _extract_response_text(data)
-                if done_text and done_text.startswith(output_text):
-                    async for chunk in emit_text_delta(done_text[len(output_text) :]):
-                        yield chunk
-                elif done_text and not output_text:
-                    async for chunk in emit_text_delta(done_text):
-                        yield chunk
+            elif _is_openai_choice_delta(data):
+                async for chunk in emit_text_delta(_extract_response_text(data)):
+                    yield chunk
+
+            elif event_type in {"response.output_text.done", "response.text.done"}:
+                async for chunk in emit_text_snapshot(_extract_response_text(data)):
+                    yield chunk
+
+            elif event_type in {"response.content_part.done", "response.content_part.added"}:
+                async for chunk in emit_text_snapshot(_extract_response_text(data)):
+                    yield chunk
 
             elif event_type == "response.output_item.added":
                 tool_call = _extract_tool_call_from_item(data.get("item"))
@@ -899,15 +1012,13 @@ async def _anthropic_stream_from_responses(
                 if tool_call:
                     async for chunk in stop_tool_block(tool_call):
                         yield chunk
+                else:
+                    async for chunk in emit_text_snapshot(_extract_response_text(data), allow_disjoint=True):
+                        yield chunk
 
             elif event_type == "response.completed":
-                completed_text = _extract_response_text(data)
-                if completed_text and completed_text.startswith(output_text):
-                    async for chunk in emit_text_delta(completed_text[len(output_text) :]):
-                        yield chunk
-                elif completed_text and not output_text:
-                    async for chunk in emit_text_delta(completed_text):
-                        yield chunk
+                async for chunk in emit_text_snapshot(_extract_response_text(data), allow_disjoint=True):
+                    yield chunk
 
                 for tool_call in _extract_completed_tool_calls(data):
                     async for chunk in stop_tool_block(tool_call):
@@ -939,6 +1050,10 @@ async def _anthropic_stream_from_responses(
                 )
 
         if text_index is None and not tool_used:
+            logger.warning(
+                "upstream stream produced no Anthropic content event_types=%s",
+                ",".join(sorted(seen_event_types)) or "-",
+            )
             yield _sse_event(
                 "content_block_start",
                 {
@@ -1080,6 +1195,17 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
     usage = _anthropic_usage_from_response_usage({})
     tool_calls: list[dict[str, str]] = []
 
+    def append_text_snapshot(text_snapshot: str, *, allow_disjoint: bool = False) -> None:
+        nonlocal output_text
+
+        if not text_snapshot:
+            return
+
+        if text_snapshot.startswith(output_text):
+            output_text += text_snapshot[len(output_text) :]
+        elif not output_text or (allow_disjoint and text_snapshot not in output_text):
+            output_text += text_snapshot
+
     async for event, raw_data in _iter_sse_events(upstream_response):
         if raw_data == "[DONE]":
             continue
@@ -1088,25 +1214,23 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
         except json.JSONDecodeError:
             continue
 
-        event_type = data.get("type") or event
-        if event_type == "response.output_text.delta":
+        event_type = data.get("type") or data.get("object") or event
+        if event_type in {"response.output_text.delta", "response.text.delta", "response.content_part.delta"}:
             output_text += _extract_response_text(data)
-        elif event_type == "response.output_text.done":
-            done_text = _extract_response_text(data)
-            if done_text and done_text.startswith(output_text):
-                output_text += done_text[len(output_text) :]
-            elif done_text and not output_text:
-                output_text = done_text
+        elif _is_openai_choice_delta(data):
+            output_text += _extract_response_text(data)
+        elif event_type in {"response.output_text.done", "response.text.done"}:
+            append_text_snapshot(_extract_response_text(data))
+        elif event_type in {"response.content_part.done", "response.content_part.added"}:
+            append_text_snapshot(_extract_response_text(data))
         elif event_type == "response.output_item.done":
             tool_call = _extract_tool_call_from_item(data.get("item"))
             if tool_call:
                 tool_calls.append(tool_call)
+            else:
+                append_text_snapshot(_extract_response_text(data), allow_disjoint=True)
         elif event_type == "response.completed":
-            completed_text = _extract_response_text(data)
-            if completed_text and completed_text.startswith(output_text):
-                output_text += completed_text[len(output_text) :]
-            elif completed_text and not output_text:
-                output_text = completed_text
+            append_text_snapshot(_extract_response_text(data), allow_disjoint=True)
             usage = _extract_response_usage(data)
             tool_calls.extend(_extract_completed_tool_calls(data))
 
