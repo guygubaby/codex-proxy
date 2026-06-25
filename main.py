@@ -233,6 +233,8 @@ def _apply_codex_responses_headers(headers: dict[str, str], payload: dict[str, A
     header_keys = {key.lower() for key in headers}
     if payload and payload.get("stream") is True:
         headers["accept"] = "text/event-stream"
+    elif payload is not None:
+        headers["accept"] = "application/json"
     elif "accept" not in header_keys:
         headers["accept"] = "application/json"
 
@@ -817,9 +819,12 @@ async def _anthropic_stream_from_responses(
     tool_blocks: dict[str, dict[str, Any]] = {}
     tool_used = False
     final_usage = _anthropic_usage_from_response_usage({})
+    emitted_text_chars = 0
+    emitted_text_deltas = 0
+    emitted_tool_blocks = 0
 
     async def emit_text_delta(text_delta: str) -> AsyncIterator[bytes]:
-        nonlocal output_text, text_index, next_content_index
+        nonlocal emitted_text_chars, emitted_text_deltas, output_text, text_index, next_content_index
 
         if not text_delta:
             return
@@ -837,6 +842,8 @@ async def _anthropic_stream_from_responses(
             )
 
         output_text += text_delta
+        emitted_text_chars += len(text_delta)
+        emitted_text_deltas += 1
         yield _sse_event(
             "content_block_delta",
             {
@@ -860,7 +867,7 @@ async def _anthropic_stream_from_responses(
                 yield chunk
 
     async def start_tool_block(tool_call: dict[str, str]) -> AsyncIterator[bytes]:
-        nonlocal next_content_index, tool_used
+        nonlocal emitted_tool_blocks, next_content_index, tool_used
 
         item_id = tool_call["item_id"]
         if item_id not in tool_blocks:
@@ -878,6 +885,7 @@ async def _anthropic_stream_from_responses(
         if not block["started"]:
             block["started"] = True
             tool_used = True
+            emitted_tool_blocks += 1
             yield _sse_event(
                 "content_block_start",
                 {
@@ -1064,6 +1072,15 @@ async def _anthropic_stream_from_responses(
             )
             yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
 
+        logger.info(
+            "stream_convert model=%s text_chars=%s text_deltas=%s tool_blocks=%s event_types=%s",
+            model,
+            emitted_text_chars,
+            emitted_text_deltas,
+            emitted_tool_blocks,
+            ",".join(sorted(seen_event_types)) or "-",
+        )
+
         yield _sse_event(
             "message_delta",
             {
@@ -1194,6 +1211,7 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
     output_text = ""
     usage = _anthropic_usage_from_response_usage({})
     tool_calls: list[dict[str, str]] = []
+    seen_event_types: set[str] = set()
 
     def append_text_snapshot(text_snapshot: str, *, allow_disjoint: bool = False) -> None:
         nonlocal output_text
@@ -1215,6 +1233,7 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
             continue
 
         event_type = data.get("type") or data.get("object") or event
+        seen_event_types.add(str(event_type or "(none)"))
         if event_type in {"response.output_text.delta", "response.text.delta", "response.content_part.delta"}:
             output_text += _extract_response_text(data)
         elif _is_openai_choice_delta(data):
@@ -1233,6 +1252,14 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
             append_text_snapshot(_extract_response_text(data), allow_disjoint=True)
             usage = _extract_response_usage(data)
             tool_calls.extend(_extract_completed_tool_calls(data))
+
+    logger.info(
+        "message_convert model=%s text_chars=%s tool_calls=%s event_types=%s",
+        model,
+        len(output_text),
+        len(tool_calls),
+        ",".join(sorted(seen_event_types)) or "-",
+    )
 
     content: list[dict[str, Any]] = []
     if output_text:
