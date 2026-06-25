@@ -156,6 +156,35 @@ def _resolve_upstream_model(model: str) -> str:
     return model
 
 
+def _is_codex_upstream() -> bool:
+    return "/backend-api/codex" in settings.upstream_base_url.lower()
+
+
+def _codex_base_path_includes_responses() -> bool:
+    return settings.upstream_base_url.rstrip("/").lower().endswith("/backend-api/codex/responses")
+
+
+def _responses_upstream_path() -> str:
+    if not _is_codex_upstream():
+        return "v1/responses"
+    return "" if _codex_base_path_includes_responses() else "responses"
+
+
+def _proxy_upstream_path(path: str) -> str:
+    normalized = _normalize_proxy_path(path)
+    if not _is_codex_upstream():
+        return normalized
+
+    if normalized == "v1/responses":
+        return _responses_upstream_path()
+
+    if normalized.startswith("v1/responses/"):
+        suffix = normalized[len("v1/responses/") :]
+        return suffix if _codex_base_path_includes_responses() else f"responses/{suffix}"
+
+    return normalized
+
+
 def _build_upstream_url(path: str, query: str) -> httpx.URL:
     base = settings.upstream_base_url
     if not base:
@@ -188,6 +217,34 @@ def _build_upstream_headers(request: Request, path: str) -> dict[str, str]:
 
     headers.setdefault("user-agent", "codex-proxy/0.1.0")
     return headers
+
+
+def _apply_codex_responses_headers(headers: dict[str, str], payload: dict[str, Any] | None = None) -> None:
+    if not _is_codex_upstream():
+        return
+
+    header_keys = {key.lower() for key in headers}
+    if "openai-beta" not in header_keys:
+        headers["openai-beta"] = "responses=experimental"
+    if "originator" not in header_keys:
+        headers["originator"] = "codex_cli_rs"
+    headers["content-type"] = "application/json"
+
+    header_keys = {key.lower() for key in headers}
+    if payload and payload.get("stream") is True:
+        headers["accept"] = "text/event-stream"
+    elif "accept" not in header_keys:
+        headers["accept"] = "application/json"
+
+
+def _is_responses_proxy_path(path: str) -> bool:
+    normalized = _normalize_proxy_path(path)
+    return (
+        normalized == "v1/responses"
+        or normalized.startswith("v1/responses/")
+        or normalized == "responses"
+        or normalized.startswith("responses/")
+    )
 
 
 def _filter_response_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -306,17 +363,18 @@ def _anthropic_content_to_text(content: Any) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def _anthropic_messages_to_responses_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _anthropic_messages_to_responses_payload(
+    payload: dict[str, Any],
+    *,
+    stream: bool,
+    codex_compat: bool,
+) -> dict[str, Any]:
     input_items: list[dict[str, Any]] = []
+    instructions: list[str] = []
 
-    system = payload.get("system")
-    if system:
-        input_items.append(
-            {
-                "role": "system",
-                "content": _anthropic_content_to_text(system),
-            }
-        )
+    system_text = _anthropic_content_to_text(payload.get("system", ""))
+    if system_text:
+        instructions.append(system_text)
 
     for message in payload.get("messages", []):
         if not isinstance(message, dict):
@@ -326,18 +384,27 @@ def _anthropic_messages_to_responses_payload(payload: dict[str, Any]) -> dict[st
         if role not in {"user", "assistant", "system", "developer"}:
             role = "user"
 
-        input_items.append(
-            {
-                "role": role,
-                "content": _anthropic_content_to_text(message.get("content", "")),
-            }
-        )
+        if role in {"system", "developer"}:
+            text = _anthropic_content_to_text(message.get("content", ""))
+            if text:
+                instructions.append(text)
+            continue
+
+        if role == "assistant":
+            _append_responses_assistant_input(input_items, message.get("content", ""))
+        else:
+            _append_responses_user_input(input_items, message.get("content", ""))
 
     responses_payload: dict[str, Any] = {
         "model": _resolve_upstream_model(str(payload.get("model") or "gpt-5.3-codex")),
         "input": input_items,
-        "stream": True,
+        "stream": stream,
     }
+
+    if instructions:
+        responses_payload["instructions"] = "\n\n".join(instructions)
+    elif codex_compat:
+        responses_payload["instructions"] = ""
 
     max_tokens = payload.get("max_tokens")
     if isinstance(max_tokens, int) and max_tokens > 0:
@@ -364,7 +431,125 @@ def _anthropic_messages_to_responses_payload(payload: dict[str, Any]) -> dict[st
             if isinstance(tool, dict) and tool.get("name")
         ]
 
+    tool_choice = _responses_tool_choice(payload.get("tool_choice"))
+    if tool_choice:
+        responses_payload["tool_choice"] = tool_choice
+
+    if codex_compat:
+        responses_payload["store"] = False
+        responses_payload.pop("max_output_tokens", None)
+        responses_payload.pop("temperature", None)
+
     return responses_payload
+
+
+def _append_responses_user_input(input_items: list[dict[str, Any]], content: Any) -> None:
+    if not isinstance(content, list):
+        text = _anthropic_content_to_text(content)
+        if text:
+            input_items.append({"role": "user", "content": [{"type": "input_text", "text": text}]})
+        return
+
+    parts: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+
+        if block.get("type") == "tool_result":
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": str(block.get("tool_use_id", "")),
+                    "output": _anthropic_content_to_text(block.get("content", "")),
+                }
+            )
+            continue
+
+        converted = _anthropic_block_to_responses_part(block, "user")
+        if converted:
+            parts.append(converted)
+
+    if parts:
+        input_items.append({"role": "user", "content": parts})
+
+
+def _append_responses_assistant_input(input_items: list[dict[str, Any]], content: Any) -> None:
+    if not isinstance(content, list):
+        text = _anthropic_content_to_text(content)
+        if text:
+            input_items.append({"role": "assistant", "content": [{"type": "output_text", "text": text}]})
+        return
+
+    parts: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+
+        if block.get("type") == "tool_use":
+            tool_input = block.get("input", {})
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            input_items.append(
+                {
+                    "type": "function_call",
+                    "call_id": str(block.get("id", "")),
+                    "name": str(block.get("name", "")),
+                    "arguments": json.dumps(tool_input, ensure_ascii=False, separators=(",", ":")),
+                }
+            )
+            continue
+
+        converted = _anthropic_block_to_responses_part(block, "assistant")
+        if converted:
+            parts.append(converted)
+
+    if parts:
+        input_items.append({"role": "assistant", "content": parts})
+
+
+def _anthropic_block_to_responses_part(block: dict[str, Any], role: str) -> dict[str, Any] | None:
+    block_type = block.get("type")
+    if block_type == "text":
+        text = str(block.get("text", ""))
+        if text:
+            return {"type": "output_text" if role == "assistant" else "input_text", "text": text}
+        return None
+
+    if block_type == "thinking":
+        text = str(block.get("thinking", ""))
+        return {"type": "output_text", "text": text} if text else None
+
+    if role == "user" and block_type == "image":
+        source = block.get("source")
+        if not isinstance(source, dict):
+            return None
+
+        if source.get("type") == "base64":
+            media_type = str(source.get("media_type") or "image/jpeg")
+            data = str(source.get("data") or "")
+            if data:
+                return {"type": "input_image", "image_url": f"data:{media_type};base64,{data}"}
+
+        if source.get("type") == "url":
+            url = str(source.get("url") or "")
+            if url:
+                return {"type": "input_image", "image_url": url}
+
+    return None
+
+
+def _responses_tool_choice(value: Any) -> Any:
+    if not value:
+        return None
+    if value == "auto":
+        return "auto"
+    if value == "any":
+        return "required"
+    if value == "none":
+        return "none"
+    if isinstance(value, dict) and value.get("type") == "tool" and value.get("name"):
+        return {"type": "function", "name": str(value["name"])}
+    return None
 
 
 def _sse_event(event: str | None, data: Any) -> bytes:
@@ -520,6 +705,17 @@ async def _anthropic_stream_from_responses(
     upstream_response: httpx.Response,
     model: str,
 ) -> AsyncIterator[bytes]:
+    if not _is_event_stream(upstream_response.headers):
+        body_text = (await upstream_response.aread()).decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body_text)
+        except json.JSONDecodeError:
+            payload = {"output_text": body_text, "usage": {}}
+
+        async for chunk in _anthropic_stream_from_message_body(_response_payload_to_anthropic_message_body(payload, model)):
+            yield chunk
+        return
+
     message_id = f"msg_{int(time.time() * 1000)}"
     output_text = ""
     text_index: int | None = None
@@ -775,7 +971,111 @@ async def _anthropic_stream_from_responses(
         )
 
 
+async def _anthropic_stream_from_message_body(message: dict[str, Any]) -> AsyncIterator[bytes]:
+    yield _sse_event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                **message,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+            },
+        },
+    )
+
+    content = message.get("content", [])
+    if not isinstance(content, list):
+        content = []
+
+    for index, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+
+        if block.get("type") == "tool_use":
+            yield _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "input": {},
+                    },
+                },
+            )
+            yield _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block.get("input", {}), ensure_ascii=False, separators=(",", ":")),
+                    },
+                },
+            )
+            yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
+            continue
+
+        yield _sse_event(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+        text = str(block.get("text", ""))
+        if text:
+            yield _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            )
+        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
+
+    yield _sse_event(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": message.get("stop_reason") or "end_turn",
+                "stop_sequence": None,
+            },
+            "usage": message.get("usage") or _anthropic_usage_from_response_usage({}),
+        },
+    )
+    yield _sse_event("message_stop", {"type": "message_stop"})
+
+
 async def _anthropic_message_from_responses(upstream_response: httpx.Response, model: str) -> Response:
+    if not _is_event_stream(upstream_response.headers):
+        body_text = (await upstream_response.aread()).decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body_text)
+        except json.JSONDecodeError:
+            return JSONResponse(
+                {
+                    "id": f"msg_{int(time.time() * 1000)}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [{"type": "text", "text": body_text}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": _anthropic_usage_from_response_usage({}),
+                }
+            )
+
+        return JSONResponse(_response_payload_to_anthropic_message_body(payload, model))
+
     output_text = ""
     usage = _anthropic_usage_from_response_usage({})
     tool_calls: list[dict[str, str]] = []
@@ -845,6 +1145,88 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
             "usage": usage,
         }
     )
+
+
+def _is_event_stream(headers: httpx.Headers) -> bool:
+    return "text/event-stream" in headers.get("content-type", "").lower()
+
+
+def _response_payload_to_anthropic_message_body(payload: Any, model: str) -> dict[str, Any]:
+    output_text = _extract_response_payload_text(payload)
+    tool_calls = _extract_completed_tool_calls({"response": payload})
+    usage = _anthropic_usage_from_response_usage(payload.get("usage", {}) if isinstance(payload, dict) else {})
+    response_model = str(payload.get("model") or model) if isinstance(payload, dict) else model
+
+    content: list[dict[str, Any]] = []
+    if output_text:
+        content.append({"type": "text", "text": output_text})
+
+    seen_tool_ids: set[str] = set()
+    for tool_call in tool_calls:
+        tool_use_id = tool_call["tool_use_id"]
+        if tool_use_id in seen_tool_ids:
+            continue
+        seen_tool_ids.add(tool_use_id)
+
+        try:
+            tool_input = json.loads(tool_call.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            tool_input = {"arguments": tool_call.get("arguments", "")}
+
+        content.append(
+            {
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": tool_call["name"],
+                "input": tool_input,
+            }
+        )
+
+    return {
+        "id": str(payload.get("id") or f"msg_{int(time.time() * 1000)}") if isinstance(payload, dict) else f"msg_{int(time.time() * 1000)}",
+        "type": "message",
+        "role": "assistant",
+        "model": response_model,
+        "content": content or [{"type": "text", "text": ""}],
+        "stop_reason": "tool_use" if tool_calls else "end_turn",
+        "stop_sequence": None,
+        "usage": usage,
+    }
+
+
+def _extract_response_payload_text(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return ""
+
+    parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            output_text = block.get("output_text")
+            if isinstance(output_text, str):
+                parts.append(output_text)
+
+    return "".join(parts)
 
 
 def _model_id_from_raw(raw_model: Any) -> str:
@@ -975,10 +1357,16 @@ async def anthropic_messages(request: Request) -> Response:
         messages=len(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else 0,
         tools=len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else 0,
     )
-    upstream_payload = _anthropic_messages_to_responses_payload(payload)
-    upstream_url = _build_upstream_url("v1/responses", "")
-    upstream_headers = _build_upstream_headers(request, "v1/responses")
+    upstream_path = _responses_upstream_path()
+    upstream_payload = _anthropic_messages_to_responses_payload(
+        payload,
+        stream=wants_stream,
+        codex_compat=_is_codex_upstream(),
+    )
+    upstream_url = _build_upstream_url(upstream_path, "")
+    upstream_headers = _build_upstream_headers(request, upstream_path)
     upstream_headers["content-type"] = "application/json"
+    _apply_codex_responses_headers(upstream_headers, upstream_payload)
 
     client: httpx.AsyncClient = request.app.state.http_client
     upstream_request = client.build_request(
@@ -992,14 +1380,15 @@ async def anthropic_messages(request: Request) -> Response:
         start = time.monotonic()
         upstream_response = await client.send(upstream_request, stream=True)
         elapsed_ms = int((time.monotonic() - start) * 1000)
-        _log_upstream_response("v1/messages->v1/responses", upstream_response, elapsed_ms)
+        route = f"v1/messages->{upstream_path or '(base)'}"
+        _log_upstream_response(route, upstream_response, elapsed_ms)
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="Upstream request timed out") from exc
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
     if upstream_response.status_code >= 400:
-        return await _upstream_error_response("v1/messages->v1/responses", upstream_response, elapsed_ms)
+        return await _upstream_error_response(route, upstream_response, elapsed_ms)
 
     if wants_stream:
         return StreamingResponse(
@@ -1084,8 +1473,11 @@ async def _proxy(request: Request, full_path: str) -> Response:
         return JSONResponse({"ok": True})
 
     _log_request(request, path, query=bool(request.url.query))
-    upstream_url = _build_upstream_url(path, request.url.query)
-    upstream_headers = _build_upstream_headers(request, path)
+    upstream_path = _proxy_upstream_path(path)
+    upstream_url = _build_upstream_url(upstream_path, request.url.query)
+    upstream_headers = _build_upstream_headers(request, upstream_path)
+    if _is_responses_proxy_path(path) or _is_responses_proxy_path(upstream_path):
+        _apply_codex_responses_headers(upstream_headers)
     body = await request.body()
 
     client: httpx.AsyncClient = request.app.state.http_client
