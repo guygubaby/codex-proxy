@@ -72,6 +72,8 @@ class Settings:
             "CODEX_PROXY_UPSTREAM_BASE_URL",
             DEFAULT_UPSTREAM_BASE_URL,
         ).rstrip("/")
+        self.model_map = _env_json_object("CODEX_PROXY_MODEL_MAP")
+        self.retry_models = _env_list("CODEX_PROXY_RETRY_MODELS")
         self.anthropic_version = DEFAULT_ANTHROPIC_VERSION
         self.connect_timeout = _env_float("CODEX_PROXY_CONNECT_TIMEOUT", 30.0)
         self.write_timeout = _env_float("CODEX_PROXY_WRITE_TIMEOUT", 60.0)
@@ -93,6 +95,29 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _env_list(name: str) -> list[str]:
+    value = os.getenv(name, "")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _env_json_object(name: str) -> dict[str, str]:
+    value = os.getenv(name, "")
+    if not value:
+        return {}
+
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        logger.warning("invalid JSON in %s; ignoring model map", name)
+        return {}
+
+    if not isinstance(payload, dict):
+        logger.warning("%s must be a JSON object; ignoring model map", name)
+        return {}
+
+    return {str(key): str(mapped) for key, mapped in payload.items() if mapped}
 
 
 settings = Settings()
@@ -152,8 +177,24 @@ def _is_anthropic_request(request: Request) -> bool:
 
 def _resolve_upstream_model(model: str) -> str:
     if model.startswith("anthropic/"):
-        return model.split("/", 1)[1]
-    return model
+        model = model.split("/", 1)[1]
+    return settings.model_map.get(model, model)
+
+
+def _retry_models_for(model: str) -> list[str]:
+    upstream_model = _resolve_upstream_model(model)
+    seen = {model, upstream_model}
+    retry_models: list[str] = []
+
+    for candidate in settings.retry_models:
+        candidate_upstream_model = _resolve_upstream_model(candidate)
+        if not candidate_upstream_model or candidate_upstream_model in seen:
+            continue
+        seen.add(candidate)
+        seen.add(candidate_upstream_model)
+        retry_models.append(candidate)
+
+    return retry_models
 
 
 def _is_codex_upstream() -> bool:
@@ -883,6 +924,12 @@ def _without_tools_payload(payload: dict[str, Any]) -> dict[str, Any]:
     retry_payload = dict(payload)
     retry_payload.pop("tools", None)
     retry_payload.pop("tool_choice", None)
+    return retry_payload
+
+
+def _with_model_payload(payload: dict[str, Any], model: str) -> dict[str, Any]:
+    retry_payload = dict(payload)
+    retry_payload["model"] = model
     return retry_payload
 
 
@@ -1716,16 +1763,17 @@ async def anthropic_messages(request: Request) -> Response:
     await upstream_response.aclose()
 
     async def retry_with_legacy_text(retry_source_payload: dict[str, Any], label: str) -> Response:
-        logger.warning(
-            "%s model=%s tools=%s reason=upstream_response_failed",
-            label,
-            model,
-            len(retry_source_payload.get("tools", [])) if isinstance(retry_source_payload.get("tools"), list) else 0,
-        )
         retry_upstream_payload = _anthropic_messages_to_legacy_text_responses_payload(
             retry_source_payload,
             stream=False,
             codex_compat=_is_codex_upstream(),
+        )
+        logger.warning(
+            "%s model=%s upstream_model=%s tools=%s reason=upstream_response_failed",
+            label,
+            model,
+            retry_upstream_payload.get("model", ""),
+            len(retry_source_payload.get("tools", [])) if isinstance(retry_source_payload.get("tools"), list) else 0,
         )
         retry_upstream_headers = _build_upstream_headers(request, upstream_path)
         retry_upstream_headers["content-type"] = "application/json"
@@ -1759,6 +1807,21 @@ async def anthropic_messages(request: Request) -> Response:
         retry_response = await retry_with_legacy_text(payload, "retry_legacy_text")
         if _is_retryable_codex_failure(retry_response) and _has_tools(payload):
             retry_response = await retry_with_legacy_text(_without_tools_payload(payload), "retry_legacy_text_without_tools")
+        if not _is_retryable_codex_failure(retry_response):
+            return retry_response
+
+        for retry_model in _retry_models_for(model):
+            retry_response = await retry_with_legacy_text(_with_model_payload(payload, retry_model), "retry_model")
+            if not _is_retryable_codex_failure(retry_response):
+                return retry_response
+            if _has_tools(payload):
+                retry_response = await retry_with_legacy_text(
+                    _without_tools_payload(_with_model_payload(payload, retry_model)),
+                    "retry_model_without_tools",
+                )
+                if not _is_retryable_codex_failure(retry_response):
+                    return retry_response
+
         return retry_response
 
     return response

@@ -29,6 +29,13 @@ Logs are written to stdout. Set `CODEX_PROXY_LOG_LEVEL=DEBUG` or
 auth header source, upstream status, request ID, model transform counts, and
 truncated upstream error bodies; API keys are not logged.
 
+Optional model controls:
+
+- `CODEX_PROXY_MODEL_MAP`: JSON object for direct upstream model remapping, for
+  example `{"gpt-5.3-codex-spark":"gpt-5.4"}`.
+- `CODEX_PROXY_RETRY_MODELS`: comma-separated upstream model fallback list used
+  only after retryable upstream failures, for example `gpt-5.4,gpt-5.5`.
+
 ## Docker Compose
 
 ```bash
