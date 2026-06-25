@@ -400,7 +400,7 @@ def _anthropic_messages_to_responses_payload(
     responses_payload: dict[str, Any] = {
         "model": _resolve_upstream_model(str(payload.get("model") or "gpt-5.3-codex")),
         "input": input_items,
-        "stream": True if codex_compat else stream,
+        "stream": stream,
     }
 
     if instructions:
@@ -783,6 +783,30 @@ def _extract_response_failure(data: dict[str, Any]) -> dict[str, str]:
         "status": response_status,
         "message": "Upstream response failed",
     }
+
+
+def _should_retry_without_tools(response: Response, payload: dict[str, Any]) -> bool:
+    if not _is_codex_upstream():
+        return False
+    if not isinstance(payload.get("tools"), list) or not payload["tools"]:
+        return False
+    if getattr(response, "status_code", 200) < 500:
+        return False
+
+    body = getattr(response, "body", b"")
+    if isinstance(body, bytes):
+        body_text = body.decode("utf-8", errors="replace")
+    else:
+        body_text = str(body)
+
+    return "stream_incomplete" in body_text or "websocket closed" in body_text or "Upstream response failed" in body_text
+
+
+def _without_tools_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    retry_payload = dict(payload)
+    retry_payload.pop("tools", None)
+    retry_payload.pop("tool_choice", None)
+    return retry_payload
 
 
 def _extract_tool_call_from_item(item: Any) -> dict[str, str] | None:
@@ -1613,6 +1637,46 @@ async def anthropic_messages(request: Request) -> Response:
 
     response = await _anthropic_message_from_responses(upstream_response, model)
     await upstream_response.aclose()
+    if _should_retry_without_tools(response, payload):
+        logger.warning(
+            "retry_without_tools model=%s tools=%s reason=upstream_response_failed",
+            model,
+            len(payload.get("tools", [])),
+        )
+        retry_source_payload = _without_tools_payload(payload)
+        retry_upstream_payload = _anthropic_messages_to_responses_payload(
+            retry_source_payload,
+            stream=False,
+            codex_compat=_is_codex_upstream(),
+        )
+        retry_upstream_headers = _build_upstream_headers(request, upstream_path)
+        retry_upstream_headers["content-type"] = "application/json"
+        _apply_codex_responses_headers(retry_upstream_headers, retry_upstream_payload)
+        retry_upstream_request = client.build_request(
+            "POST",
+            upstream_url,
+            headers=retry_upstream_headers,
+            content=json.dumps(retry_upstream_payload, ensure_ascii=False).encode("utf-8"),
+        )
+
+        try:
+            start = time.monotonic()
+            retry_upstream_response = await client.send(retry_upstream_request, stream=True)
+            retry_elapsed_ms = int((time.monotonic() - start) * 1000)
+            retry_route = f"{route}:retry_without_tools"
+            _log_upstream_response(retry_route, retry_upstream_response, retry_elapsed_ms)
+        except httpx.TimeoutException as exc:
+            raise HTTPException(status_code=504, detail="Upstream retry timed out") from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Upstream retry failed: {exc}") from exc
+
+        if retry_upstream_response.status_code >= 400:
+            return await _upstream_error_response(retry_route, retry_upstream_response, retry_elapsed_ms)
+
+        retry_response = await _anthropic_message_from_responses(retry_upstream_response, model)
+        await retry_upstream_response.aclose()
+        return retry_response
+
     return response
 
 
