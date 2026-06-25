@@ -400,7 +400,7 @@ def _anthropic_messages_to_responses_payload(
     responses_payload: dict[str, Any] = {
         "model": _resolve_upstream_model(str(payload.get("model") or "gpt-5.3-codex")),
         "input": input_items,
-        "stream": stream,
+        "stream": True if codex_compat else stream,
     }
 
     if instructions:
@@ -752,6 +752,39 @@ def _extract_response_usage(data: dict[str, Any]) -> dict[str, int]:
     return _anthropic_usage_from_response_usage(data.get("usage", {}))
 
 
+def _extract_response_failure(data: dict[str, Any]) -> dict[str, str]:
+    response = data.get("response")
+    response_status = str(response.get("status", "")) if isinstance(response, dict) else ""
+
+    error = data.get("error")
+    if not error and isinstance(response, dict):
+        error = response.get("error") or response.get("incomplete_details")
+
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("reason") or "Upstream response failed")
+        return {
+            "type": str(error.get("type") or data.get("type") or "api_error"),
+            "code": str(error.get("code") or ""),
+            "status": response_status,
+            "message": _truncate_log_value(message, 1000),
+        }
+
+    if isinstance(error, str):
+        return {
+            "type": str(data.get("type") or "api_error"),
+            "code": "",
+            "status": response_status,
+            "message": _truncate_log_value(error, 1000),
+        }
+
+    return {
+        "type": str(data.get("type") or "api_error"),
+        "code": "",
+        "status": response_status,
+        "message": "Upstream response failed",
+    }
+
+
 def _extract_tool_call_from_item(item: Any) -> dict[str, str] | None:
     if not isinstance(item, dict):
         return None
@@ -1035,13 +1068,20 @@ async def _anthropic_stream_from_responses(
                 final_usage = _extract_response_usage(data)
 
             elif event_type in {"response.failed", "response.incomplete", "error"}:
-                error = data.get("error", data)
-                message = error.get("message", "Upstream response failed") if isinstance(error, dict) else str(error)
+                failure = _extract_response_failure(data)
+                logger.warning(
+                    "upstream_response_failed model=%s event_type=%s status=%s code=%s message=%s",
+                    model,
+                    event_type,
+                    failure["status"],
+                    failure["code"],
+                    failure["message"],
+                )
                 yield _sse_event(
                     "error",
                     {
                         "type": "error",
-                        "error": {"type": "api_error", "message": message},
+                        "error": {"type": "api_error", "message": failure["message"]},
                     },
                 )
                 return
@@ -1212,6 +1252,7 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
     usage = _anthropic_usage_from_response_usage({})
     tool_calls: list[dict[str, str]] = []
     seen_event_types: set[str] = set()
+    upstream_failure: dict[str, str] | None = None
 
     def append_text_snapshot(text_snapshot: str, *, allow_disjoint: bool = False) -> None:
         nonlocal output_text
@@ -1252,6 +1293,8 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
             append_text_snapshot(_extract_response_text(data), allow_disjoint=True)
             usage = _extract_response_usage(data)
             tool_calls.extend(_extract_completed_tool_calls(data))
+        elif event_type in {"response.failed", "response.incomplete", "error"}:
+            upstream_failure = _extract_response_failure(data)
 
     logger.info(
         "message_convert model=%s text_chars=%s tool_calls=%s event_types=%s",
@@ -1260,6 +1303,26 @@ async def _anthropic_message_from_responses(upstream_response: httpx.Response, m
         len(tool_calls),
         ",".join(sorted(seen_event_types)) or "-",
     )
+
+    if upstream_failure:
+        logger.warning(
+            "upstream_response_failed model=%s event_types=%s status=%s code=%s message=%s",
+            model,
+            ",".join(sorted(seen_event_types)) or "-",
+            upstream_failure["status"],
+            upstream_failure["code"],
+            upstream_failure["message"],
+        )
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": upstream_failure["message"],
+                },
+            },
+            status_code=502,
+        )
 
     content: list[dict[str, Any]] = []
     if output_text:
